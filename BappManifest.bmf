@@ -1,0 +1,12 @@
+Uuid: 0e61c786db0c4ac787a08c4516d52ccf
+ExtensionType: 2
+Name: JS Link Finder
+RepoName: js-link-finder
+ScreenVersion: 1.0.0
+SerialVersion: 1
+MinPlatformVersion: 0
+ProOnly: True
+Author: InitRoot
+ShortDescription: Burp Extension for passively scanning JavaScript files for endpoint links.
+EntryPoint: FransLinkfinder.py
+BuildCommand: 
