@@ -20,6 +20,7 @@ from java.awt import EventQueue
 from java.lang import Runnable
 from thread import start_new_thread
 from javax.swing import JFileChooser
+from urlparse import urlparse
 
 # Using the Runnable class for thread-safety with Swing
 class Run(Runnable):
@@ -30,9 +31,6 @@ class Run(Runnable):
         self.runner()
 
 # Needed params
-
-JSExclusionList = ['jquery', 'google-analytics','gpt.js']
-
 class BurpExtender(IBurpExtender, IScannerCheck, ITab):
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
@@ -41,8 +39,8 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
 
         callbacks.issueAlert("BurpJSLinkFinder Passive Scanner enabled")
 
-        stdout = PrintWriter(callbacks.getStdout(), True)
-        stderr = PrintWriter(callbacks.getStderr(), True)
+        self.stdout = PrintWriter(callbacks.getStdout(), True)
+        self.stderr = PrintWriter(callbacks.getStderr(), True)
         callbacks.registerScannerCheck(self)
         self.initUI()
         self.callbacks.addSuiteTab(self)
@@ -50,6 +48,8 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         print ("Burp JS LinkFinder loaded.")
         print ("Copyright (c) 2019 Frans Hendrik Botes")
         self.outputTxtArea.setText("Burp JS LinkFinder loaded." + "\n" + "Copyright (c) 2019 Frans Hendrik Botes" + "\n")
+
+        self.dynamicExclusionList = None
 
     def initUI(self):
         self.tab = swing.JPanel()
@@ -67,6 +67,8 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         self.exportBtn = swing.JButton("Export Log", actionPerformed=self.exportLog)
         self.parentFrm = swing.JFileChooser()
 
+        self.exclusionLabel = swing.JLabel("Exclusion list (separated by by comma):")
+        self.exclusionInput = swing.JTextField() # TODO: Save configuration
 
 
         # Layout
@@ -79,6 +81,8 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
             layout.createParallelGroup()
             .addGroup(layout.createSequentialGroup()
                 .addGroup(layout.createParallelGroup()
+                    .addComponent(self.exclusionLabel)
+                    .addComponent(self.exclusionInput)
                     .addComponent(self.outputLabel)
                     .addComponent(self.logPane)
                     .addComponent(self.clearBtn)
@@ -91,6 +95,8 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
             layout.createParallelGroup()
             .addGroup(layout.createParallelGroup()
                 .addGroup(layout.createSequentialGroup()
+                    .addComponent(self.exclusionLabel)
+                    .addComponent(self.exclusionInput)
                     .addComponent(self.outputLabel)
                     .addComponent(self.logPane)
                     .addComponent(self.clearBtn)
@@ -116,7 +122,77 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         open(filename, 'w', 0).write(self.outputTxtArea.text)
 
     
+    def make_request(self, base_request_url, link_found):
+        '''
+        Make a new request using Burp and analyze the response. 
+        If returns 200: add to sitemap
+        url: string
+        '''
+        # Parse base_request_url
+        parsed_base_url = urlparse(base_request_url)
+        base_http_protocol = parsed_base_url.scheme
+        base_address_and_port = parsed_base_url.netloc.split(':')
+        base_host = base_address_and_port[0]
+
+        if len(base_address_and_port) > 1 and base_address_and_port[1]:
+            base_port = int(base_address_and_port[1])
+        else:
+            base_port = 80 if (base_http_protocol == 'http') else 443
+
+        # Try to make a valid URL from Origin + path found 
+        if link_found.startswith('http://') or link_found.startswith('https://'):
+            target_url = link_found
+        elif link_found.startswith('//'):
+            target_url = 'https:' + link_found
+        elif link_found.startswith('/'):
+            target_url = 'https://' + base_host  + link_found
+        else:
+            target_url = 'https://' + base_host + '/' + link_found
+
+        # Parse target_url
+        parsed_url = urlparse(target_url)
+        http_protocol = parsed_url.scheme
+        address_and_port = parsed_url.netloc.split(':')
+        host = address_and_port[0]
+
+        if len(address_and_port) > 1 and address_and_port[1]:     
+            port = int(address_and_port[1])
+        else:
+            port = 80 if (http_protocol == 'http') else 443
+
+        # Make request to the URL
+        my_new_request_headers = [
+            'GET ' + parsed_url.path + '?' + parsed_url.query + ' HTTP/1.1',
+            'host: ' + host
+        ]
+        my_new_request_body = ''
+        my_new_request = self.helpers.buildHttpMessage(
+            my_new_request_headers,
+            self.helpers.stringToBytes(my_new_request_body)
+        )
+
+        # Send request
+        my_http_service = self.helpers.buildHttpService(host, port, http_protocol)
+        my_new_http_request_response = self.callbacks.makeHttpRequest(
+            my_http_service,
+            my_new_request
+        )
+
+        # Analyze the response
+        analyzed_response = self.helpers.analyzeResponse(my_new_http_request_response.getResponse())
+        status_code = analyzed_response.getStatusCode()
+
+        print('-----------> ' + target_url + ' -- ' + str(status_code))
+
+        # Logic for adding to sitemap is here
+        if status_code in [200]:
+            self.callbacks.addToSiteMap(my_new_http_request_response)
+
     def doPassiveScan(self, ihrr):
+        '''
+        The Scanner invokes this method for each base request / response that is passively scanned.
+        Note: Extensions should only analyze the HTTP messages provided during passive scanning, and should not make any new HTTP requests of their own.
+        '''
         
         try:
             urlReq = ihrr.getUrl()
@@ -125,7 +201,9 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
             # check if JS file
             if ".js" in str(urlReq):
                 # Exclude casual JS files
-                if any(x in testString for x in JSExclusionList):
+                self.dynamicExclusionList = str(self.exclusionInput.getText().strip()).split(',') if str(self.exclusionInput.getText().strip()) else None
+
+                if self.dynamicExclusionList and any(x in testString for x in self.dynamicExclusionList):
                     print("\n" + "[-] URL excluded " + str(urlReq))
                 else:
                     self.outputTxtArea.append("\n" + "[+] Valid URL found: " + str(urlReq))
@@ -133,7 +211,7 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
                     for counter, issueText in enumerate(issueText):
                             #print("TEST Value returned SUCCESS")
                             self.outputTxtArea.append("\n" + "\t" + str(counter)+' - ' +issueText['link'])   
-
+                            self.make_request(testString, issueText['link'])
                     issues = ArrayList()
                     issues.add(SRI(ihrr, self.helpers))
                     return issues
