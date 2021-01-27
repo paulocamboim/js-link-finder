@@ -50,6 +50,9 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         self.outputTxtArea.setText("Burp JS LinkFinder loaded." + "\n" + "Copyright (c) 2019 Frans Hendrik Botes" + "\n")
 
         self.dynamicExclusionList = None
+        self.lastKnownOrigin = ''
+        self.lastKnownReferer = ''
+        self.load_config()
 
     def initUI(self):
         self.tab = swing.JPanel()
@@ -68,8 +71,7 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         self.parentFrm = swing.JFileChooser()
 
         self.exclusionLabel = swing.JLabel("Exclusion list (separated by by comma):")
-        self.exclusionInput = swing.JTextField() # TODO: Save configuration
-
+        self.exclusionInput = swing.JTextField(focusLost=self.save_config)
 
         # Layout
         layout = swing.GroupLayout(self.tab)
@@ -122,6 +124,14 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         open(filename, 'w', 0).write(self.outputTxtArea.text)
 
     
+    def save_config(self, event):
+        self.dynamicExclusionList = self.exclusionInput.getText().strip()
+        self.callbacks.saveExtensionSetting('exclusion_list', self.exclusionInput.getText().strip())
+
+    def load_config(self):
+        self.dynamicExclusionList = self.callbacks.loadExtensionSetting('exclusion_list') if self.callbacks.loadExtensionSetting('exclusion_list') else ''
+        self.exclusionInput.setText(self.dynamicExclusionList)
+
     def make_request(self, base_request_url, link_found):
         '''
         Make a new request using Burp and analyze the response. 
@@ -143,11 +153,14 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         if link_found.startswith('http://') or link_found.startswith('https://'):
             target_url = link_found
         elif link_found.startswith('//'):
-            target_url = 'https:' + link_found
+            target_url = base_http_protocol + ':' + link_found
         elif link_found.startswith('/'):
-            target_url = 'https://' + base_host  + link_found
+            target_url = base_http_protocol + '://' + base_host + ':' + str(base_port)  + link_found
         else:
-            target_url = 'https://' + base_host + '/' + link_found
+            target_url = base_http_protocol + '://' + base_host + ':' + str(base_port) + '/' + link_found
+
+        # Print the formated target URL
+        # self.outputTxtArea.append("\n" + "\t" + "--->" + target_url)
 
         # Parse target_url
         parsed_url = urlparse(target_url)
@@ -161,10 +174,15 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
             port = 80 if (http_protocol == 'http') else 443
 
         # Make request to the URL
+        get_query = ''
+        if parsed_url.query:
+            get_query = '?' + parsed_url.query
+
         my_new_request_headers = [
-            'GET ' + parsed_url.path + '?' + parsed_url.query + ' HTTP/1.1',
-            'host: ' + host
+            'GET ' + parsed_url.path + get_query + ' HTTP/1.1',
+            'host: ' + host + ':' + str(port)
         ]
+
         my_new_request_body = ''
         my_new_request = self.helpers.buildHttpMessage(
             my_new_request_headers,
@@ -179,10 +197,12 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         )
 
         # Analyze the response
-        analyzed_response = self.helpers.analyzeResponse(my_new_http_request_response.getResponse())
-        status_code = analyzed_response.getStatusCode()
-
-        print('-----------> ' + target_url + ' -- ' + str(status_code))
+        if my_new_http_request_response.getResponse():
+            analyzed_response = self.helpers.analyzeResponse(my_new_http_request_response.getResponse())
+            if analyzed_response:
+                status_code = analyzed_response.getStatusCode()
+                # Debug target and http code
+                # print('--> Request to ' + target_url + ' | HTTP Code: ' + str(status_code))
 
         # Logic for adding to sitemap is here
         if status_code in [200]:
@@ -193,8 +213,23 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
         The Scanner invokes this method for each base request / response that is passively scanned.
         Note: Extensions should only analyze the HTTP messages provided during passive scanning, and should not make any new HTTP requests of their own.
         '''
-        
+
         try:
+            analyzed_request = self.helpers.analyzeRequest(ihrr.getRequest())
+            request_headers = analyzed_request.getHeaders()
+
+            # Get Referer or origin to make a request
+            origin = self.lastKnownOrigin
+            referer = self.lastKnownReferer
+            for header in request_headers:
+                if header.lower().startswith('referer'):
+                    [header_name, referer] = header.replace(' ','').split(':', 1)
+                    self.lastKnownReferer = referer
+
+                if header.lower().startswith('origin'):
+                    [header_name, origin] = header.replace(' ','').split(':', 1)
+                    self.lastKnownOrigin = origin
+
             urlReq = ihrr.getUrl()
             testString = str(urlReq)
             linkA = linkAnalyse(ihrr,self.helpers)
@@ -211,7 +246,13 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
                     for counter, issueText in enumerate(issueText):
                             #print("TEST Value returned SUCCESS")
                             self.outputTxtArea.append("\n" + "\t" + str(counter)+' - ' +issueText['link'])   
-                            self.make_request(testString, issueText['link'])
+
+                            if self.lastKnownOrigin:
+                                self.make_request(self.lastKnownOrigin, issueText['link'])
+                            else:
+                                if self.lastKnownReferer:
+                                    self.make_request(self.lastKnownReferer, issueText['link'])
+
                     issues = ArrayList()
                     issues.add(SRI(ihrr, self.helpers))
                     return issues
